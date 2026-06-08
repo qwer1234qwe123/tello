@@ -3,7 +3,7 @@ import cv2
 import os
 
 # 저장 폴더 생성
-save_dir = "dataset/images"
+save_dir = "dataset/images2"
 os.makedirs(save_dir, exist_ok=True)
 
 tello = Tello()
@@ -37,6 +37,7 @@ while True:
         print(f"촬영: {filename}")
 
     elif key == ord('q'):  # 종료
+        
         break
 
 tello.streamoff()
