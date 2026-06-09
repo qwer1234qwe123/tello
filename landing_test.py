@@ -3,44 +3,42 @@ from ultralytics import YOLO
 import cv2
 import time
 import os
+import threading
+import signal
+import sys
 
 MODEL_PATH = "models/best.pt"
-CONF_THRESHOLD = 0.2
+CONF_THRESHOLD = 0.25
+CY_CLOSE = 300
 
-# cy 기준 (화면 세로 720px 기준)
-# 원기둥 cy가 이 값 이하면 충분히 가까운 것 → 하강
-CY_CLOSE = 400
+stop_flag = False
 
-def safe_move(tello, direction, cm):
-    while cm > 0:
-        step = min(cm, 100)
-        if direction == "up":        tello.move_up(step)
-        elif direction == "down":    tello.move_down(step)
-        elif direction == "forward": tello.move_forward(step)
-        elif direction == "back":    tello.move_back(step)
-        elif direction == "left":    tello.move_left(step)
-        elif direction == "right":   tello.move_right(step)
-        cm -= step
-        time.sleep(1.5)
+def signal_handler(sig, frame):
+    global stop_flag
+    print("\nCtrl+C detected! Landing...")
+    stop_flag = True
 
-frame_skip_count = 0
-last_det = None
+signal.signal(signal.SIGINT, signal_handler)
 
-def get_fresh_frame(frame_read):
-    for _ in range(10):
+latest_frame = None
+frame_lock = threading.Lock()
+
+def frame_capture_thread(frame_read):
+    while not stop_flag:
         frame = frame_read.frame
         if frame is not None and frame.size > 0:
-            return frame.copy()
-        time.sleep(0.05)
+            with frame_lock:
+                global latest_frame
+                latest_frame = frame.copy()
+        time.sleep(0.03)
+
+def get_frame():
+    with frame_lock:
+        if latest_frame is not None:
+            return latest_frame.copy()
     return None
 
 def detect_cylinder(frame, model):
-    global frame_skip_count, last_det
-    frame_skip_count += 1
-    # 3프레임마다 1번만 YOLO 실행
-    if frame_skip_count % 3 != 0:
-        return last_det
-
     results = model(frame, conf=CONF_THRESHOLD, verbose=False)
     best_box = None
     best_conf = 0
@@ -54,7 +52,6 @@ def detect_cylinder(frame, model):
             w  = int(x2 - x1)
             h  = int(y2 - y1)
             best_box = (cx, cy, w, h, float(conf))
-    last_det = best_box
     return best_box
 
 def show_frame(frame, det, status, tello):
@@ -66,8 +63,6 @@ def show_frame(frame, det, status, tello):
     cv2.line(display, (cx_s, cy_s-50), (cx_s, cy_s+50), (0,255,0), 1)
     cv2.circle(display, (cx_s, cy_s), 60, (0,255,0), 1)
     cv2.line(display, (0, CY_CLOSE), (fw, CY_CLOSE), (255,0,255), 1)
-    cv2.putText(display, f"CLOSE LINE", (fw-150, CY_CLOSE-5),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,0,255), 1)
 
     if det is not None:
         cx, cy, w, h, conf = det
@@ -94,31 +89,48 @@ def show_frame(frame, det, status, tello):
     cv2.imshow("Landing Test", display)
     cv2.waitKey(1)
 
-def align_lr(tello, frame_read, model):
-    frame = get_fresh_frame(frame_read)
+def safe_move(tello, direction, cm):
+    if stop_flag:
+        return
+    try:
+        if direction == "forward": tello.move_forward(cm)
+        elif direction == "back":  tello.move_back(cm)
+        elif direction == "left":  tello.move_left(cm)
+        elif direction == "right": tello.move_right(cm)
+        elif direction == "up":    tello.move_up(cm)
+        elif direction == "down":  tello.move_down(cm)
+        time.sleep(1.5)
+    except Exception as e:
+        print(f"  Move error: {e}")
+
+def align_lr(tello, model):
+    if stop_flag:
+        return False
+    frame = get_frame()
     if frame is None:
-        return
+        return False
     det = detect_cylinder(frame, model)
-    show_frame(frame, det, "Aligning LR...", tello)
+    show_frame(frame, det, "Aligning...", tello)
     if det is None:
-        return
+        return False
     fw = frame.shape[1]
     cx_s = fw // 2
     cx, cy, w, h, conf = det
     dx = int(cx - cx_s)
-    margin = 80
-    if abs(dx) > margin:
-        move_cm = max(20, min(abs(dx) // 7, 50))  # 최소 20cm
-        try:
-            if dx > 0:
-                print(f"  Right {move_cm}cm (dx={dx})")
-                tello.move_right(move_cm)
-            else:
-                print(f"  Left {move_cm}cm (dx={dx})")
-                tello.move_left(move_cm)
-            time.sleep(1.2)
-        except Exception as e:
-            print(f"  Align error: {e} - skip")
+    if abs(dx) <= 80:
+        return True
+    move_cm = max(20, min(abs(dx) // 6, 40))
+    try:
+        if dx > 0:
+            print(f"  Right {move_cm}cm (dx={dx})")
+            tello.move_right(move_cm)
+        else:
+            print(f"  Left {move_cm}cm (dx={dx})")
+            tello.move_left(move_cm)
+        time.sleep(1.5)
+    except Exception as e:
+        print(f"  Align skip: {e}")
+    return False
 
 # =============================================
 #  메인
@@ -135,22 +147,25 @@ tello.connect()
 print(f"Battery: {tello.get_battery()}%")
 
 tello.streamon()
-print("Stream ON - waiting 3sec...")
 time.sleep(3)
-
 frame_read = tello.get_frame_read()
 time.sleep(2)
 
+t = threading.Thread(target=frame_capture_thread, args=(frame_read,), daemon=True)
+t.start()
+print("Frame thread started!")
+time.sleep(1)
+
 for _ in range(30):
-    f = frame_read.frame
-    if f is not None and f.size > 0:
+    f = get_frame()
+    if f is not None:
         print(f"Camera OK! {f.shape}")
         break
-    time.sleep(0.1)
+    time.sleep(0.2)
 
 print("\n====================================")
 print("  Auto Landing Test")
-print("  원기둥 정면 100cm, 높이 30cm 시작")
+print("  원기둥 정면 100cm 에 놓기")
 print("  3초 후 자동 시작!")
 print("====================================")
 for i in range(3, 0, -1):
@@ -158,35 +173,39 @@ for i in range(3, 0, -1):
     time.sleep(1)
 
 try:
-    # ==========================================
-    #  이륙
-    # ==========================================
+    # 이륙
     print("\n[1] Takeoff!")
     tello.takeoff()
-    print("Stabilizing 7sec...")
-    time.sleep(7)  # 충분히 대기
+    print("Stabilizing 5sec...")
+    time.sleep(5)
 
-    # ==========================================
-    #  30cm로 낮추기
-    # ==========================================
+    if stop_flag:
+        tello.land()
+        sys.exit()
+
+    # 20cm로 낮추기
     current_h = tello.get_height()
-    print(f"Height: {current_h}cm -> 30cm")
-    if current_h > 40:
-        diff = current_h - 30
-        print(f"  Down {diff}cm - waiting 2sec before move...")
-        time.sleep(2)  # 하강 전 추가 대기
-        tello.move_down(min(diff, 100))
-        time.sleep(3)  # 하강 후 안정화
+    print(f"Height: {current_h}cm -> 20cm")
+    if current_h > 30:
+        diff = current_h - 20
+        print(f"  Down {diff}cm")
+        time.sleep(3)
+        try:
+            tello.move_down(min(diff, 100))
+            time.sleep(3)
+        except Exception as e:
+            print(f"  Down error: {e}")
     print(f"Ready at {tello.get_height()}cm")
 
-    # ==========================================
-    #  카메라 켜서 원기둥 탐지
-    # ==========================================
+    # 탐지
     print("\n[2] Searching cylinder...")
     detected = False
-    for i in range(60):  # 최대 6초
-        frame = get_fresh_frame(frame_read)
+    for i in range(60):
+        if stop_flag:
+            break
+        frame = get_frame()
         if frame is None:
+            time.sleep(0.1)
             continue
         det = detect_cylinder(frame, model)
         show_frame(frame, det, f"Searching {i+1}/60", tello)
@@ -196,82 +215,73 @@ try:
             break
         time.sleep(0.1)
 
-    if not detected:
-        print("Not found! Landing...")
+    if not detected or stop_flag:
+        print("Not found or stopped! Landing...")
         tello.land()
     else:
         # ==========================================
-        #  전진 루프
-        #  cy > CY_CLOSE → 멀다 → 전진 + 좌우정렬
-        #  cy <= CY_CLOSE → 가깝다 → 하강
-        #  탐지 안됨 → 매우 가까움 → 하강
+        #  접근: 5번 전진 (25cm x 5 = 125cm)
+        #  스텝 1~2: 정렬 + 전진
+        #  스텝 3~5: 정렬 없이 직진만
         # ==========================================
-        print("\n[3] Approaching cylinder...")
-        not_found_count = 0
+        print("\n[3] Approaching (5 x 25cm)...")
 
-        while True:
-            frame = get_fresh_frame(frame_read)
-            if frame is None:
-                continue
-
-            det = detect_cylinder(frame, model)
-            show_frame(frame, det, "Approaching...", tello)
-
-            if det is None:
-                not_found_count += 1
-                print(f"  Not detected ({not_found_count}/3) - very close!")
-                if not_found_count >= 3:
-                    print("  Start descending!")
-                    break
-                time.sleep(0.2)
-                continue
-
-            not_found_count = 0
-            cx, cy, w, h, conf = det
-            print(f"  cy={cy} (close<={CY_CLOSE})")
-
-            # 좌우 정렬
-            align_lr(tello, frame_read, model)
-
-            # cy가 기준선 위로 올라오면 하강
-            if cy <= CY_CLOSE:
-                print(f"  Close! cy={cy} -> descend")
+        for step in range(5):
+            if stop_flag:
                 break
 
-            # 전진 30cm
-            print(f"  Forward 30cm (cy={cy})")
-            try:
-                tello.move_forward(30)
-                time.sleep(1.5)
-            except Exception as e:
-                print(f"  Forward error: {e}")
+            print(f"\n  Step {step+1}/5")
+
+            # 스텝 1~2만 좌우 정렬
+            if step < 2:
+                print(f"  Aligning (step {step+1})")
+                align_lr(tello, model)
+                if stop_flag:
+                    break
+            else:
+                print(f"  No alignment - straight forward")
+
+            # 전진 25cm
+            print(f"  Forward 25cm")
+            safe_move(tello, "forward", 25)
+
+            # 전진 후 높이 확인
+            current_h = tello.get_height()
+            print(f"  H after: {current_h}cm")
+
+            # 화면 표시 (스텝 1~2만 탐지 표시)
+            if step < 2:
+                frame = get_frame()
+                if frame is not None:
+                    det = detect_cylinder(frame, model)
+                    show_frame(frame, det, f"Step {step+1}/5", tello)
+                    if det is not None:
+                        print(f"  cy={det[1]}")
+            else:
+                frame = get_frame()
+                if frame is not None:
+                    show_frame(frame, None, f"Step {step+1}/5 - straight", tello)
+
+            time.sleep(0.5)
+
+        if stop_flag:
+            tello.land()
+            sys.exit()
 
         # ==========================================
-        #  하강 루프
+        #  스텝 5 완료 후 빠르게 하강 + 착지
+        #  (지면 효과 방지)
         # ==========================================
-        print("\n[4] Descending...")
-        while tello.get_height() > 20:
-            frame = get_fresh_frame(frame_read)
-            if frame is None:
-                continue
-
-            det = detect_cylinder(frame, model)
-            h_val = tello.get_height()
-            show_frame(frame, det, f"Descending H:{h_val}cm", tello)
-
-            if det is not None:
-                align_lr(tello, frame_read, model)
-
-            print(f"  Down 20cm (H:{tello.get_height()}cm)")
+        print("\n[4] Fast descend + land!")
+        current_h = tello.get_height()
+        print(f"  Current height: {current_h}cm")
+        if current_h > 30:
             try:
-                tello.move_down(20)
-                time.sleep(1.5)
+                print(f"  Fast down {current_h - 10}cm")
+                tello.move_down(min(current_h - 10, 100))
+                time.sleep(0.5)  # 짧게 대기
             except Exception as e:
                 print(f"  Down error: {e}")
-
-        # ==========================================
-        #  착지
-        # ==========================================
         print("\n[5] Landing!")
         tello.land()
 
@@ -284,6 +294,7 @@ except Exception as e:
         pass
 
 finally:
+    stop_flag = True
     tello.streamoff()
     cv2.destroyAllWindows()
     print("\nDone!")
