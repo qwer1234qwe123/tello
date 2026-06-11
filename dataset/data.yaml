@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['cylinder']
+
+roboflow:
+  workspace: kimshs-workspace
+  project: tello-landing-qkp5u
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/kimshs-workspace/tello-landing-qkp5u/dataset/1
