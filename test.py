@@ -1,11 +1,15 @@
-# test.py
-import cv2
-import numpy as np
 from djitellopy import Tello
-from ultralytics import YOLO
-    
-print("cv2:", cv2.__version__)
-print("numpy:", np.__version__)
-print("djitellopy 설치 완료!")
-print("ultralytics 설치 완료!")
-print("모든 라이브러리 정상!")
+import time
+
+tello = Tello()
+tello.connect()
+
+bat = tello.get_battery()
+print(f"Battery: {bat}%")
+
+if bat < 20:
+    print("Battery too low! Exit program.")
+    tello.end()
+    exit()
+
+print("Battery OK - safe to fly")
